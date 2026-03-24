@@ -1,3 +1,4 @@
 #!/bin/bash
+set -e
 pip install -r requirements.txt
-python run.py
+python main.py
