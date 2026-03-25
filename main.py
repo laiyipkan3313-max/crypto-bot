@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import pandas as pd
 import numpy as np
-from binance.client import Client
+import ccxt
 import google.generativeai as genai
 from datetime import datetime
 import os
@@ -18,18 +18,23 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-WATCH_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+WATCH_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 SCAN_INTERVAL = 120
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 try:
-    binance_client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+    exchange = ccxt.binance({
+        'apiKey': BINANCE_API_KEY,
+        'secret': BINANCE_API_SECRET,
+        'enableRateLimit': True,
+    })
+    exchange.load_markets()
     logger.info("幣安 API 連接成功")
 except Exception as e:
     logger.error(f"幣安 API 連接失敗: {e}")
-    binance_client = None
+    exchange = None
 
 try:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -41,15 +46,13 @@ except Exception as e:
 
 sent_signals = defaultdict(lambda: {"time": 0, "price": 0})
 
-def get_klines(symbol, interval, limit=500):
+def get_klines(symbol, timeframe, limit=500):
     try:
-        if not binance_client:
+        if not exchange:
             return None
-        klines = binance_client.get_historical_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(klines, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['open_time', 'open', 'high', 'low', 'close', 'volume'])
         df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col])
         return df
     except Exception as e:
         logger.error(f"獲取 K 線失敗: {e}")
@@ -57,19 +60,19 @@ def get_klines(symbol, interval, limit=500):
 
 def get_ticker_info(symbol):
     try:
-        if not binance_client:
+        if not exchange:
             return {}
-        return binance_client.get_ticker(symbol=symbol)
+        return exchange.fetch_ticker(symbol)
     except:
         return {}
 
 def get_order_book(symbol, limit=20):
     try:
-        if not binance_client:
+        if not exchange:
             return None, None
-        ob = binance_client.get_order_book(symbol=symbol, limit=limit)
-        bids = np.array([[float(p), float(q)] for p, q in ob['bids']])
-        asks = np.array([[float(p), float(q)] for p, q in ob['asks']])
+        ob = exchange.fetch_order_book(symbol, limit)
+        bids = np.array(ob['bids'][:limit]) if ob['bids'] else None
+        asks = np.array(ob['asks'][:limit]) if ob['asks'] else None
         return bids, asks
     except:
         return None, None
@@ -165,7 +168,7 @@ async def auto_scan(app, chat_id):
                     bids, asks = get_order_book(symbol)
                     if df_1h is None or df_15m is None:
                         continue
-                    current_price = float(ticker.get('lastPrice', 0))
+                    current_price = float(ticker.get('last', 0))
                     direction_1h = get_1h_direction(df_1h)
                     levels = analyze_ict_levels(df_1h, df_15m)
                     pattern_5m = analyze_5m_pattern(df_5m)
@@ -199,10 +202,10 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
+
     async def start_scan(context):
         await auto_scan(app, TELEGRAM_CHAT_ID)
-    
+
     app.job_queue.run_once(start_scan, when=0)
     logger.info("✅ 機械人已啟動")
     app.run_polling()
