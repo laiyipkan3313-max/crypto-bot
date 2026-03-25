@@ -1,66 +1,3 @@
-
-
-協作
-
-分享
-好，可以開始修改
-好！我開始寫完整代碼，需要幾分鐘。
-已確認加入KILL ZONE時間過濾、4H與1H方向一致性，以及TP設置在下一個關鍵區，並加入訂單系統，接下來會開始撰寫完整主程式。
-
-已完成完整主程式撰寫，包含所有ICT邏輯、訂單系統與倉位管理，接下來將進行測試和優化。
-
-完成完整代碼，並初始化訂單編號系統，將信號與持倉提示對應。接下來會檢查GitHub授權並嘗試推送最新版本。
-
-代碼已寫完並推送到 fork。由於 GitHub 權限限制無法自動建立 PR，需要你手動合併。請按以下步驟操作：
-完成主要代碼並推送到fork，但因權限限制，須手動在GitHub合併PR，接著會進行後續功能完善。
-
-✅ 完整 ICT 交易信號機械人代碼已完成
-代碼已推送至 fork：https://github.com/sc8c9tyv72-cell/crypto-bot
-需要你手動合併到主 Repo
-由於 GitHub 權限限制 ，請按以下步驟操作：
-方法 A（最簡單）：直接複製文件
-打開 Railway → 你的 crypto-bot 項目
-在 Railway 的 GitHub 設定中，直接將 main.py 內容替換
-或者：到 https://github.com/laiyipkan3313-max/crypto-bot ，手動編輯 main.py，貼上新代碼
-方法 B：從 fork 建立 PR
-打開 https://github.com/sc8c9tyv72-cell/crypto-bot
-點擊 "Contribute" → "Open pull request"
-Merge 到 laiyipkan3313-max/crypto-bot
-新代碼功能總覽
-功能
-說明
-4H + 1H 方向
-HH/HL vs LH/LL 結構判斷
-15M 關鍵區
-OB / FVG / SNR / FIB(0.618/0.705/0.786 ) / Breaker / EQH/EQL
-Kill Zone 過濾
-亞洲 01:00-03:00 / 倫敦 15:00-17:00 / 紐約 21:30-23:30 HKT
-信號類型
-⚠️ 留意 → 🚨 入場(CHoCH) → ✅ 確認(BOS) → 🔔 持倉管理
-訂單編號
-#BTC-20260325-2130-L001 格式
-動態 TP
-下一個關鍵區（最低 1:1.5 RR 保底）
-SL
-關鍵區外 0.2%
-5M 形態
-吞沒 / 錘子 / 射擊之星 / Pin Bar
-心跳訊息
-每小時確認機械人運行中
-合併後 Railway 會自動重新部署
-Railway 偵測到 GitHub 更新後會自動觸發重新部署，約 2-3 分鐘後生效。
-main.py
-程式碼 · 36.85 KB
-查看此任務中的所有檔案
-任務已完成
-這個結果怎麼樣？
-建議追問
-
-
-GitHubMy Browser
-
-
-main.py
 #!/usr/bin/env python3
 """
 ICT/SMC Crypto Trading Signal Bot
@@ -852,4 +789,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-如何整合Gemini幣安Telegram為加密貨幣分析AI - Manus
