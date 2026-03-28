@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ICT/SMC 加密貨幣交易信號機械人 v4.1
+ICT/SMC 加密貨幣交易信號機械人 v4.3
 ====================================
 框架（按用戶 PDF）：
   1H 定方向（BSL/SSL 流動性判斷）
@@ -10,14 +10,22 @@ ICT/SMC 加密貨幣交易信號機械人 v4.1
   → Displacement + FIB OTE 入場（FVG/OB 在 0.618-0.786 區域）
   → 順勢全倉（50 USDT）/ 逆勢半倉（25 USDT）
   → RR ≥ 1:2 才發信號
-  → SL 放在 15M Swing High/Low 外
+  → SL 放在「關鍵區接觸後反轉確認」的關鍵位外側
 
-數據量：1H 500根（21天）/ 15M 300根（75小時）/ 3M 200根（10小時）
+數據量：1H 500根（21天）/ 4H 200根（33天）/ 15M 300根（75小時）/ 3M 200根（10小時）
 數據源：Binance data-api.binance.vision（無地區限制）+ api.binance.us 備用
-v4.1 修復：
-  - 改用 data-api.binance.vision 解決 Railway 地區封鎖問題
-  - 修復 format_hourly_report 縮排 bug（try 塊未包含主體代碼）
-  - 每小時快報加入完整錯誤捕獲
+
+v4.2 修復：
+  ① SL 邏輯：先找「最近被接觸過的關鍵區」，SL 放在該區外側（非單純 Swing High/Low）
+     - 做多：找價格下方最近一個曾被觸及的 OB/FVG/SNR，SL 放在該區 Low 下方 0.1%
+     - 做空：找價格上方最近一個曾被觸及的 OB/FVG/SNR，SL 放在該區 High 上方 0.1%
+     - 若找不到，退回 15M Swing High/Low 外
+     - 加入 4H OB 輔助識別（4H OB 作為更大的 SL 錨點）
+  ② 每小時快報重構：最多 6 個關鍵位
+     - 最外圍 2 個（1H 最遠的上方 + 下方，定方向用）
+     - 最近 2 個上方阻力 + 最近 2 個下方支撐
+     - ICT/SMC 優先級：PWH/PWL/PDH/PDL/WO/DO > BSL/SSL > 1H OB/FVG > 15M OB/FVG
+     - FIB 只作輔助：若最近關鍵位附近（±0.5%）有 FIB 重疊，在後方加標 [+FIB 0.618] 等
 """
 
 import os
@@ -46,15 +54,11 @@ RISK_HALF = 25.0
 MIN_ZONE_PCT = 0.002       # 關鍵區最小寬度 0.2%
 HKT = timezone(timedelta(hours=8))
 
-# API 端點（按優先順序）
-# data-api.binance.vision = Binance 官方數據 API，無地區限制
-# api.binance.us = Binance US，備用
 BINANCE_ENDPOINTS = [
     "https://data-api.binance.vision",
     "https://api.binance.us",
 ]
 
-# 訂單計數器（每個幣種+方向獨立，重啟重置）
 order_counters: dict = defaultdict(int)
 
 # ── Binance API ───────────────────────────────────────
@@ -69,7 +73,6 @@ def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
             )
             if r.status_code == 200:
                 data = r.json()
-                # 檢查是否為錯誤回應（dict 而非 list）
                 if isinstance(data, dict):
                     logger.warning(f"{base} {symbol} {interval}: API 錯誤 {data.get('msg', data)}")
                     continue
@@ -102,7 +105,7 @@ def get_daily_weekly_levels(symbol: str) -> dict:
                 if isinstance(d, list) and len(d) >= 2:
                     levels['PDH'] = float(d[-2][2])
                     levels['PDL'] = float(d[-2][3])
-                    levels['DO']  = float(d[-1][1])   # 今日開盤
+                    levels['DO']  = float(d[-1][1])
                     break
         except Exception as e:
             logger.warning(f"get_daily {base} {symbol}: {e}")
@@ -116,7 +119,7 @@ def get_daily_weekly_levels(symbol: str) -> dict:
                 if isinstance(w, list) and len(w) >= 2:
                     levels['PWH'] = float(w[-2][2])
                     levels['PWL'] = float(w[-2][3])
-                    levels['WO']  = float(w[-1][1])   # 本週開盤
+                    levels['WO']  = float(w[-1][1])
                     break
         except Exception as e:
             logger.warning(f"get_weekly {base} {symbol}: {e}")
@@ -151,7 +154,6 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
 
 # ── 市場結構分析 ──────────────────────────────────────
 def find_swing_points(df: pd.DataFrame, n: int = 5) -> tuple:
-    """識別擺動高低點"""
     highs, lows = [], []
     for i in range(n, len(df) - n):
         h = float(df.iloc[i]['high'])
@@ -163,7 +165,6 @@ def find_swing_points(df: pd.DataFrame, n: int = 5) -> tuple:
     return highs, lows
 
 def find_swing_dual(df: pd.DataFrame) -> tuple:
-    """雙層擺動點（n=3 短期 + n=8 中期）合併去重"""
     sh3, sl3 = find_swing_points(df, n=3)
     sh8, sl8 = find_swing_points(df, n=8)
     def merge(a, b):
@@ -175,7 +176,6 @@ def find_swing_dual(df: pd.DataFrame) -> tuple:
     return merge(sh3, sh8), merge(sl3, sl8)
 
 def get_market_structure(df: pd.DataFrame, lookback: int = 20) -> str:
-    """判斷市場結構：bullish / bearish / ranging"""
     if df is None or len(df) < lookback:
         return "ranging"
     sub = df.iloc[-lookback:]
@@ -195,7 +195,6 @@ def get_market_structure(df: pd.DataFrame, lookback: int = 20) -> str:
     return "ranging"
 
 def get_bsl_ssl(df: pd.DataFrame) -> tuple:
-    """識別 BSL（上方流動性）和 SSL（下方流動性）"""
     highs, lows = find_swing_dual(df)
     price = float(df.iloc[-1]['close'])
     bsl = min([h[1] for h in highs if h[1] > price], default=None)
@@ -203,11 +202,6 @@ def get_bsl_ssl(df: pd.DataFrame) -> tuple:
     return bsl, ssl
 
 def detect_3m_mss(df_3m: pd.DataFrame, direction: str) -> dict | None:
-    """
-    偵測 3M MSS（Market Structure Shift）
-    direction: 'bullish' = 找看漲 MSS / 'bearish' = 找看跌 MSS
-    條件：實體收線突破（不只是影線）
-    """
     if df_3m is None or len(df_3m) < 20:
         return None
     recent = df_3m.iloc[-20:].copy().reset_index(drop=True)
@@ -219,7 +213,6 @@ def detect_3m_mss(df_3m: pd.DataFrame, direction: str) -> dict | None:
         if not highs:
             return None
         last_swing_high = max(highs, key=lambda x: x[0])[1]
-        # 實體收線突破（收盤價 > 前擺動高點）
         if float(last['close']) > float(last['open']) and float(last['close']) > last_swing_high:
             return {"type": "bullish_mss", "break_price": last_swing_high,
                     "candle_close": float(last['close']), "direction": "bullish"}
@@ -233,10 +226,6 @@ def detect_3m_mss(df_3m: pd.DataFrame, direction: str) -> dict | None:
     return None
 
 def find_displacement_fvg(df: pd.DataFrame, direction: str, lookback: int = 10) -> dict | None:
-    """
-    在最近 lookback 根蠟燭中尋找 Displacement（大蠟燭位移）形成的 FVG
-    這是 MSS 後的精確入場位
-    """
     if df is None or len(df) < 3:
         return None
     recent = df.iloc[-lookback:].copy().reset_index(drop=True)
@@ -248,11 +237,9 @@ def find_displacement_fvg(df: pd.DataFrame, direction: str, lookback: int = 10) 
         k3 = recent.iloc[i+1]
         body_k2 = abs(float(k2['close']) - float(k2['open']))
         range_k2 = float(k2['high']) - float(k2['low'])
-        # 確認 k2 是大蠟燭（位移）：實體 > 50% 蠟燭範圍
         if range_k2 == 0 or body_k2 / range_k2 < 0.5:
             continue
         if direction == "bullish":
-            # 看漲 FVG：k1 High < k3 Low
             gap_low = float(k1['high'])
             gap_high = float(k3['low'])
             if gap_high > gap_low and float(k2['close']) > float(k2['open']):
@@ -264,7 +251,6 @@ def find_displacement_fvg(df: pd.DataFrame, direction: str, lookback: int = 10) 
                                 "mid": (gap_low + gap_high) / 2,
                                 "label": "位移 FVG（看漲）"}
         elif direction == "bearish":
-            # 看跌 FVG：k1 Low > k3 High
             gap_high = float(k1['low'])
             gap_low = float(k3['high'])
             if gap_high > gap_low and float(k2['close']) < float(k2['open']):
@@ -279,11 +265,6 @@ def find_displacement_fvg(df: pd.DataFrame, direction: str, lookback: int = 10) 
 
 # ── 關鍵區識別 ────────────────────────────────────────
 def find_order_blocks(df: pd.DataFrame) -> list:
-    """
-    識別 OB（Order Block）
-    看跌 OB：上升趨勢中最後一根陽燭，之後有大陰燭突破前低
-    看漲 OB：下跌趨勢中最後一根陰燭，之後有大陽燭突破前高
-    """
     obs = []
     if df is None or len(df) < 10:
         return obs
@@ -296,7 +277,6 @@ def find_order_blocks(df: pd.DataFrame) -> list:
         width = float(c['high']) - float(c['low'])
         if width / lc < MIN_ZONE_PCT:
             continue
-        # 看跌 OB：陽燭，之後有大陰燭
         if float(c['close']) > float(c['open']):
             prev_low = float(df.iloc[max(0,i-5):i]['low'].min()) if i > 0 else float('inf')
             after = df.iloc[i+1:min(i+4, len(df))]
@@ -305,7 +285,6 @@ def find_order_blocks(df: pd.DataFrame) -> list:
                             'high': float(c['high']), 'low': float(c['low']),
                             'mid': (float(c['high']) + float(c['low'])) / 2,
                             'label': '看跌 OB（供應區）', 'strength': 'strong'})
-        # 看漲 OB：陰燭，之後有大陽燭
         elif float(c['close']) < float(c['open']):
             prev_high = float(df.iloc[max(0,i-5):i]['high'].max()) if i > 0 else 0
             after = df.iloc[i+1:min(i+4, len(df))]
@@ -317,21 +296,18 @@ def find_order_blocks(df: pd.DataFrame) -> list:
     return obs
 
 def find_fvg(df: pd.DataFrame) -> list:
-    """識別 FVG（Fair Value Gap）"""
     fvgs = []
     if df is None or len(df) < 3:
         return fvgs
     lc = float(df.iloc[-1]['close'])
     for i in range(1, len(df) - 1):
         k1, k3 = df.iloc[i-1], df.iloc[i+1]
-        # 看漲 FVG
         gap_bull = float(k3['low']) - float(k1['high'])
         if gap_bull > 0 and gap_bull / lc >= MIN_ZONE_PCT:
             fvgs.append({'type': 'FVG', 'direction': 'bullish',
                          'high': float(k3['low']), 'low': float(k1['high']),
                          'mid': (float(k3['low']) + float(k1['high'])) / 2,
                          'label': '看漲 FVG（需求缺口）', 'strength': 'medium', 'bar_idx': i})
-        # 看跌 FVG
         gap_bear = float(k1['low']) - float(k3['high'])
         if gap_bear > 0 and gap_bear / lc >= MIN_ZONE_PCT:
             fvgs.append({'type': 'FVG', 'direction': 'bearish',
@@ -341,10 +317,6 @@ def find_fvg(df: pd.DataFrame) -> list:
     return fvgs
 
 def find_ifvg(df: pd.DataFrame, fvg_list: list) -> list:
-    """
-    識別 IFVG（Inverse FVG）
-    FVG 形成後，價格進入該區域並反轉 = IFVG
-    """
     ifvgs = []
     for fz in fvg_list:
         bi = fz.get('bar_idx', 0)
@@ -355,7 +327,6 @@ def find_ifvg(df: pd.DataFrame, fvg_list: list) -> list:
             row = subsequent.iloc[j]
             entered = float(row['low']) <= fz['high'] and float(row['high']) >= fz['low']
             if entered:
-                # 進入後反轉（與 FVG 方向相反的蠟燭）
                 if fz['direction'] == 'bullish' and float(row['close']) < float(row['open']):
                     ifvgs.append({'type': 'IFVG', 'direction': 'bearish',
                                   'high': fz['high'], 'low': fz['low'], 'mid': fz['mid'],
@@ -369,7 +340,6 @@ def find_ifvg(df: pd.DataFrame, fvg_list: list) -> list:
     return ifvgs
 
 def find_eqh_eql(df: pd.DataFrame, tolerance: float = 0.001) -> tuple:
-    """識別 EQH（Equal Highs）和 EQL（Equal Lows）流動性池"""
     eqh_list, eql_list = [], []
     highs, lows = find_swing_dual(df)
     for i in range(len(highs)):
@@ -385,11 +355,6 @@ def find_eqh_eql(df: pd.DataFrame, tolerance: float = 0.001) -> tuple:
     return eqh_list, eql_list
 
 def calc_fib(swing_low: float, swing_high: float, direction: str) -> dict:
-    """
-    計算 FIB 回撤位
-    做空：從高點下跌後，回調到 OTE（0.618-0.786）是做空位
-    做多：從低點上升後，回調到 OTE（0.618-0.786）是做多位
-    """
     diff = swing_high - swing_low
     if direction == "bearish":
         return {
@@ -412,27 +377,94 @@ def calc_fib(swing_low: float, swing_high: float, direction: str) -> dict:
             "swing_high": swing_high, "swing_low": swing_low
         }
 
+# ── SL 邏輯（v4.3 按 PDF 框架）────────────────────────
+def find_sl_anchor_zone(price: float, direction: str,
+                         zones_15m: list, zones_4h: list,
+                         highs_15m: list, lows_15m: list,
+                         atr: float) -> tuple:
+    """
+    v4.3 SL 邏輯（按 PDF 框架）：
+    SL = 入場關鍵區的結構性止損，放在「15M 最近 Swing High/Low 外側」
+    緩衝 = ATR × 0.5（避免被掃）
+    最小距離 = max(ATR × 1.0, 0.5%)
+
+    優先級：
+      1) 入場 OB/FVG 的 Low/High 外側 + ATR×0.5
+      2) 入場區下方（做多）/ 上方（做空）最近 15M Swing Low/High + ATR×0.5
+      3) 退回：ATR 最小距離
+    """
+    atr_buf  = atr * 0.5
+    min_dist = max(atr * 1.0, price * 0.005)
+
+    if direction == "bullish":
+        # 1) 入場 OB/FVG 的 Low 外側
+        entry_zones = sorted(
+            [z for z in zones_15m
+             if z.get('direction') == 'bullish'
+             and z.get('low', 0) < price],
+            key=lambda z: z.get('low', 0), reverse=True
+        )
+        if entry_zones:
+            anchor_low = entry_zones[0]['low']
+            sl = anchor_low - atr_buf
+            if (price - sl) >= min_dist:
+                lbl = entry_zones[0].get('label', 'OB')
+                return sl, f"15M {lbl} Low 外 (ATR×0.5 緩衝)"
+
+        # 2) 入場區下方最近 15M Swing Low 外側
+        below_lows = sorted(
+            [l[1] for l in lows_15m if l[1] < price],
+            reverse=True
+        )
+        if below_lows:
+            sl = below_lows[0] - atr_buf
+            if (price - sl) >= min_dist:
+                return sl, f"15M Swing Low {fmt(below_lows[0], '')} 外 (ATR×0.5 緩衝)"
+
+        # 3) 退回：ATR 最小距離
+        return price - min_dist, "ATR 最小止損"
+
+    else:  # bearish
+        # 1) 入場 OB/FVG 的 High 外側
+        entry_zones = sorted(
+            [z for z in zones_15m
+             if z.get('direction') == 'bearish'
+             and z.get('high', 0) > price],
+            key=lambda z: z.get('high', 0)
+        )
+        if entry_zones:
+            anchor_high = entry_zones[0]['high']
+            sl = anchor_high + atr_buf
+            if (sl - price) >= min_dist:
+                lbl = entry_zones[0].get('label', 'OB')
+                return sl, f"15M {lbl} High 外 (ATR×0.5 緩衝)"
+
+        # 2) 入場區上方最近 15M Swing High 外側
+        above_highs = sorted(
+            [h[1] for h in highs_15m if h[1] > price]
+        )
+        if above_highs:
+            sl = above_highs[0] + atr_buf
+            if (sl - price) >= min_dist:
+                return sl, f"15M Swing High {fmt(above_highs[0], '')} 外 (ATR×0.5 緩衝)"
+
+        # 3) 退回：ATR 最小距離
+        return price + min_dist, "ATR 最小止損"
+
 # ── 層級陷阱檢查 ──────────────────────────────────────
 def check_hierarchy_trap(price: float, direction: str,
                           zones_1h: list, zones_15m: list) -> tuple:
-    """
-    層級陷阱：15M 關鍵位上方/下方有 1H 未測試關鍵位
-    做空時：15M 阻力上方還有 1H 阻力 → 15M 阻力是誘餌
-    做多時：15M 支撐下方還有 1H 支撐 → 15M 支撐是誘餌
-    返回：(is_trap: bool, reason: str)
-    """
     if direction == "bearish":
         res_15m = [z for z in zones_15m if z.get('direction') == 'bearish'
                    and z.get('mid', 0) > price]
         if not res_15m:
             return False, ""
         nearest_15m = min(res_15m, key=lambda z: z.get('mid', float('inf')))
-        # 1H 在 15M 阻力上方有未測試關鍵位？
         untested_1h = [z for z in zones_1h
                        if z.get('direction') == 'bearish'
                        and z.get('mid', 0) > nearest_15m.get('mid', 0)]
         if untested_1h:
-            return True, f"層級陷阱：15M 阻力上方有 1H 未測試供應區"
+            return True, "層級陷阱：15M 阻力上方有 1H 未測試供應區"
     elif direction == "bullish":
         sup_15m = [z for z in zones_15m if z.get('direction') == 'bullish'
                    and z.get('mid', 0) < price]
@@ -443,22 +475,16 @@ def check_hierarchy_trap(price: float, direction: str,
                        if z.get('direction') == 'bullish'
                        and z.get('mid', 0) < nearest_15m.get('mid', 0)]
         if untested_1h:
-            return True, f"層級陷阱：15M 支撐下方有 1H 未測試需求區"
+            return True, "層級陷阱：15M 支撐下方有 1H 未測試需求區"
     return False, ""
 
 # ── Confluence 評分 ───────────────────────────────────
 def calc_confluence(zone: dict, all_zones: list, fib: dict | None) -> tuple:
-    """
-    計算關鍵區的 Confluence（匯聚）分數
-    越多工具重疊，分數越高
-    """
     score = 0
     reasons = []
     zone_mid = zone.get('mid', 0)
     if zone_mid == 0:
         return 0, []
-
-    # 1. 與其他關鍵區重疊（0.3% 內）
     for other in all_zones:
         if other is zone:
             continue
@@ -466,8 +492,6 @@ def calc_confluence(zone: dict, all_zones: list, fib: dict | None) -> tuple:
         if other_mid and abs(zone_mid - other_mid) / zone_mid < 0.003:
             score += 1
             reasons.append(other.get('label', '其他關鍵區'))
-
-    # 2. 與 FIB OTE 區重疊
     if fib:
         ote_low  = min(fib.get("0.618", 0), fib.get("0.786", 0))
         ote_high = max(fib.get("0.618", 0), fib.get("0.786", 0))
@@ -480,12 +504,9 @@ def calc_confluence(zone: dict, all_zones: list, fib: dict | None) -> tuple:
         elif fib.get("0.5", 0) and abs(zone_mid - fib["0.5"]) / fib["0.5"] < 0.003:
             score += 1
             reasons.append("FIB 0.5 均衡點")
-
-    # 3. 1H 級別關鍵區加分
     if zone.get('tf') == '1h':
         score += 2
         reasons.append("1H 級別關鍵位")
-
     return score, reasons
 
 # ── 主要分析函數 ──────────────────────────────────────
@@ -493,8 +514,8 @@ def analyze_symbol(symbol: str) -> dict:
     """完整分析一個幣種，返回分析結果"""
     result = {"symbol": symbol, "error": None}
 
-    # 取得數據
     df_1h  = get_klines(symbol, "1h",  500)
+    df_4h  = get_klines(symbol, "4h",  200)   # v4.2 新增：4H OB 輔助 SL
     df_15m = get_klines(symbol, "15m", 300)
     df_3m  = get_klines(symbol, "3m",  200)
     levels = get_daily_weekly_levels(symbol)
@@ -507,15 +528,17 @@ def analyze_symbol(symbol: str) -> dict:
     result["price"] = price
     result["levels"] = levels
 
-    # ── 1H 方向 + BSL/SSL ──
+    # 1H 方向 + BSL/SSL
     struct_1h = get_market_structure(df_1h, lookback=30)
     result["struct_1h"] = struct_1h
     bsl, ssl = get_bsl_ssl(df_1h.iloc[-100:])
     result["bsl"] = bsl
     result["ssl"] = ssl
 
-    # ── 1H FIB（用最近擺動高低點）──
+    # 1H FIB + Swing High/Low（用於快報最外圍位 + SL 錨點）
     highs_1h, lows_1h = find_swing_dual(df_1h.iloc[-100:])
+    result["highs_1h"] = highs_1h
+    result["lows_1h"]  = lows_1h
     fib_1h = None
     if highs_1h and lows_1h:
         h1 = max(highs_1h, key=lambda x: x[0])[1]
@@ -523,7 +546,7 @@ def analyze_symbol(symbol: str) -> dict:
         fib_1h = calc_fib(l1, h1, struct_1h if struct_1h != "ranging" else "bearish")
     result["fib_1h"] = fib_1h
 
-    # ── 1H 關鍵區（層級陷阱用）──
+    # 1H 關鍵區
     obs_1h  = find_order_blocks(df_1h.iloc[-100:])
     fvgs_1h = find_fvg(df_1h.iloc[-100:])
     for z in obs_1h + fvgs_1h:
@@ -531,7 +554,16 @@ def analyze_symbol(symbol: str) -> dict:
     zones_1h = obs_1h + fvgs_1h
     result["zones_1h"] = zones_1h
 
-    # ── 15M 關鍵區 ──
+    # 4H OB（v4.2 新增：SL 錨點用）
+    zones_4h = []
+    if df_4h is not None:
+        obs_4h = find_order_blocks(df_4h.iloc[-60:])
+        for z in obs_4h:
+            z['tf'] = '4h'
+        zones_4h = obs_4h
+    result["zones_4h"] = zones_4h
+
+    # 15M 關鍵區
     obs_15m  = find_order_blocks(df_15m)
     fvgs_15m = find_fvg(df_15m)
     ifvgs_15m = find_ifvg(df_15m, fvgs_15m)
@@ -540,17 +572,14 @@ def analyze_symbol(symbol: str) -> dict:
     zones_15m = obs_15m + fvgs_15m + ifvgs_15m
     result["zones_15m"] = zones_15m
 
-    # EQH/EQL
     eqh_list, eql_list = find_eqh_eql(df_15m)
     result["eqh"] = eqh_list
     result["eql"] = eql_list
 
-    # 15M 擺動點（SL 計算用）
     highs_15m, lows_15m = find_swing_dual(df_15m.iloc[-50:])
     result["highs_15m"] = highs_15m
     result["lows_15m"] = lows_15m
 
-    # 15M FIB（TP 計算用）
     fib_15m = None
     if highs_15m and lows_15m:
         h15 = max(highs_15m, key=lambda x: x[0])[1]
@@ -558,16 +587,15 @@ def analyze_symbol(symbol: str) -> dict:
         fib_15m = calc_fib(l15, h15, struct_1h if struct_1h != "ranging" else "bearish")
     result["fib_15m"] = fib_15m
 
-    # ATR
     result["atr_15m"] = calc_atr(df_15m)
 
-    # ── 3M MSS 偵測 ──
+    # 3M MSS
     if struct_1h == "bearish":
-        mss_trend   = detect_3m_mss(df_3m, "bearish")   # 順勢做空
-        mss_counter = detect_3m_mss(df_3m, "bullish")   # 逆勢做多
+        mss_trend   = detect_3m_mss(df_3m, "bearish")
+        mss_counter = detect_3m_mss(df_3m, "bullish")
     elif struct_1h == "bullish":
-        mss_trend   = detect_3m_mss(df_3m, "bullish")   # 順勢做多
-        mss_counter = detect_3m_mss(df_3m, "bearish")   # 逆勢做空
+        mss_trend   = detect_3m_mss(df_3m, "bullish")
+        mss_counter = detect_3m_mss(df_3m, "bearish")
     else:
         mss_trend = mss_counter = None
 
@@ -580,7 +608,6 @@ def analyze_symbol(symbol: str) -> dict:
 
 # ── 入場信號邏輯 ──────────────────────────────────────
 def find_entry_signal(result: dict) -> dict | None:
-    """根據分析結果尋找入場信號，返回信號字典或 None"""
     symbol    = result["symbol"]
     price     = result["price"]
     struct_1h = result["struct_1h"]
@@ -591,29 +618,26 @@ def find_entry_signal(result: dict) -> dict | None:
     atr_15m   = result.get("atr_15m", 0)
     levels    = result.get("levels", {})
     zones_1h  = result.get("zones_1h", [])
+    zones_4h  = result.get("zones_4h", [])
     zones_15m = result.get("zones_15m", [])
     highs_15m = result.get("highs_15m", [])
     lows_15m  = result.get("lows_15m", [])
     eqh       = result.get("eqh", [])
     eql       = result.get("eql", [])
     df_3m     = result.get("df_3m")
-    df_15m    = result.get("df_15m")
 
     if struct_1h == "ranging":
         return None
 
     def build_signal(direction: str, trade_type: str, mss: dict) -> dict | None:
-        """建立信號字典"""
         is_trend = (trade_type == "順勢")
         risk_type = "全倉" if is_trend else "半倉"
         risk_amount = RISK_FULL if is_trend else RISK_HALF
 
-        # 找最近的 15M 關鍵區
         dir_zones = [z for z in zones_15m if z.get('direction') == direction]
         if not dir_zones:
             return None
 
-        # 找價格附近的關鍵區（±1%）
         active_zone = None
         for z in sorted(dir_zones, key=lambda x: abs(x.get('mid', 0) - price)):
             if abs(z.get('mid', 0) - price) / price < 0.01:
@@ -622,13 +646,11 @@ def find_entry_signal(result: dict) -> dict | None:
         if not active_zone:
             active_zone = min(dir_zones, key=lambda z: abs(z.get('mid', 0) - price))
 
-        # 層級陷阱檢查（順勢才檢查）
         if is_trend:
-            is_trap, trap_reason = check_hierarchy_trap(price, direction, zones_1h, zones_15m)
+            is_trap, _ = check_hierarchy_trap(price, direction, zones_1h, zones_15m)
             if is_trap:
                 return None
 
-        # 逆勢需要 1H 強關鍵位支撐
         if not is_trend:
             strong_1h = [z for z in zones_1h
                          if z.get('direction') == direction
@@ -638,12 +660,10 @@ def find_entry_signal(result: dict) -> dict | None:
                                        levels.get('DO'), levels.get('WO')] if v]
             nearby_level = any(abs(price - l) / price < 0.01 for l in key_levels)
             if not strong_1h and not nearby_level:
-                return None  # 逆勢沒有 1H 強關鍵位，不入場
+                return None
 
-        # 尋找 Displacement FVG（MSS 後精確入場位）
         disp_fvg = find_displacement_fvg(df_3m, direction, lookback=10)
 
-        # 計算入場位
         entry_price = price
         entry_label = "市價入場"
         if disp_fvg:
@@ -653,30 +673,32 @@ def find_entry_signal(result: dict) -> dict | None:
             ote_705 = fib_1h.get("0.705", 0)
             if ote_705 and abs(price - ote_705) / price < 0.015:
                 entry_price = ote_705
-                entry_label = f"FIB OTE 0.705 掛單"
+                entry_label = "FIB OTE 0.705 掛單"
 
-        # SL（15M Swing High/Low 外）
-        min_sl_dist = price * 0.005  # 最少 0.5%
-        if direction == "bearish":
-            above_highs = [h[1] for h in highs_15m if h[1] > price]
-            sl = min(above_highs) * 1.001 if above_highs else price * 1.005
-        else:
-            below_lows = [l[1] for l in lows_15m if l[1] < price]
-            sl = max(below_lows) * 0.999 if below_lows else price * 0.995
-
+        # ── v4.2 新 SL 邏輯：關鍵區接觸確認 + 4H OB 錨點 ──
+        sl, sl_desc = find_sl_anchor_zone(
+            entry_price, direction,
+            zones_15m, zones_4h,
+            highs_15m, lows_15m,
+            atr_15m
+        )
         sl_dist = abs(entry_price - sl)
-        # 確保 SL 距離足夠（最少 0.5% 或 1×ATR）
-        min_dist = max(min_sl_dist, atr_15m * 1.0)
-        if sl_dist < min_dist:
-            sl = (entry_price + min_dist) if direction == "bearish" else (entry_price - min_dist)
-            sl_dist = min_dist
 
-        # TP1（15M FIB 0.5）
+        # 確保 SL 距離足夠（最少 1×ATR 或 0.5%）
+        min_dist = max(price * 0.005, atr_15m * 1.0)
+        if sl_dist < min_dist:
+            if direction == "bearish":
+                sl = entry_price + min_dist
+            else:
+                sl = entry_price - min_dist
+            sl_dist = min_dist
+            sl_desc += "（已擴展至最小距離）"
+
+        # TP
         tp1 = tp2 = None
         tp_label = ""
         if fib_15m:
             tp1 = fib_15m.get("0.5")
-        # TP2（流動性池）
         if direction == "bearish":
             below_liq = [e["price"] for e in eql if e["price"] < price]
             tp2 = max(below_liq) if below_liq else None
@@ -686,27 +708,58 @@ def find_entry_signal(result: dict) -> dict | None:
             tp2 = min(above_liq) if above_liq else None
             tp_label = "EQH 流動性" if tp2 else "15M FIB 0.5"
 
+        # ── 動態 RR（最少 1:2）────────────────────────────
+        # 優先：上方/下方最近的關鍵位作 TP1
+        # 若 RR < 1:2，嘗試下一個更遠的關鍵位
+        # 最終退回：SL 距離 × MIN_RR 作 TP1
         if not tp1:
-            tp1 = (entry_price - sl_dist * MIN_RR if direction == "bearish"
-                   else entry_price + sl_dist * MIN_RR)
-            tp_label = f"1:{MIN_RR:.0f} RR 目標"
+            # 嘗試用關鍵位作 TP（找 RR >= 1:2 的最近位）
+            all_levels = []
+            for z in zones_1h + zones_15m:
+                zm = z.get('mid', 0)
+                if zm:
+                    all_levels.append(zm)
+            for e in eqh:
+                ep = e.get('price', 0) if isinstance(e, dict) else e
+                if ep:
+                    all_levels.append(ep)
+            for e in eql:
+                ep = e.get('price', 0) if isinstance(e, dict) else e
+                if ep:
+                    all_levels.append(ep)
+
+            if direction == "bearish":
+                tp_candidates = sorted([l for l in all_levels if l < entry_price])
+                for tc in tp_candidates:
+                    if abs(entry_price - tc) / sl_dist >= MIN_RR:
+                        tp1 = tc
+                        tp_label = "關鍵位 TP（動態 RR）"
+                        break
+            else:
+                tp_candidates = sorted([l for l in all_levels if l > entry_price], reverse=True)
+                for tc in tp_candidates:
+                    if abs(entry_price - tc) / sl_dist >= MIN_RR:
+                        tp1 = tc
+                        tp_label = "關鍵位 TP（動態 RR）"
+                        break
+
+            if not tp1:
+                tp1 = (entry_price - sl_dist * MIN_RR if direction == "bearish"
+                       else entry_price + sl_dist * MIN_RR)
+                tp_label = f"1:{MIN_RR:.0f} RR 最低目標"
 
         tp_dist = abs(entry_price - tp1)
         rr = tp_dist / sl_dist if sl_dist > 0 else 0
 
-        # RR 過濾
         if rr < MIN_RR:
             return None
 
-        # Confluence 評分
         all_zones = zones_15m + zones_1h
         conf_score, conf_reasons = calc_confluence(active_zone, all_zones, fib_1h)
 
-        # 逆勢需要 Confluence ≥ 2
         if not is_trend and conf_score < 2:
             return None
 
-        # 信號類型
         if is_trend:
             signal_type = "🏄 衝浪者 A（淺回調順勢）" if not disp_fvg else "🏄 衝浪者 B（深回調順勢）"
         else:
@@ -721,7 +774,7 @@ def find_entry_signal(result: dict) -> dict | None:
             "risk_amount": risk_amount,
             "entry_price": entry_price,
             "entry_label": entry_label,
-            "sl": sl, "sl_dist": sl_dist,
+            "sl": sl, "sl_dist": sl_dist, "sl_desc": sl_desc,
             "tp1": tp1, "tp2": tp2,
             "tp_label": tp_label, "rr": rr,
             "zone": active_zone,
@@ -736,14 +789,12 @@ def find_entry_signal(result: dict) -> dict | None:
             "ssl": result.get("ssl"),
         }
 
-    # 順勢信號優先
     if mss_trend:
         direction = mss_trend["direction"]
         sig = build_signal(direction, "順勢", mss_trend)
         if sig:
             return sig
 
-    # 逆勢信號
     if mss_counter:
         direction = mss_counter["direction"]
         sig = build_signal(direction, "逆勢", mss_counter)
@@ -758,7 +809,6 @@ def format_signal_message(sig: dict) -> str:
     sym_short  = symbol.replace("USDT", "/USDT")
     direction  = sig["direction"]
     dir_emoji  = "🔴 做空 (Short)" if direction == "bearish" else "🟢 做多 (Long)"
-    dir_label  = "S" if direction == "bearish" else "L"
     struct     = sig["struct_1h"]
     struct_emoji = "⬇️ 看跌" if struct == "bearish" else "⬆️ 看漲" if struct == "bullish" else "↔️ 橫盤"
     trade_type = sig["trade_type"]
@@ -766,6 +816,7 @@ def format_signal_message(sig: dict) -> str:
     risk_amount = sig["risk_amount"]
     entry      = sig["entry_price"]
     sl         = sig["sl"]
+    sl_desc    = sig.get("sl_desc", "關鍵位外")
     tp1        = sig["tp1"]
     tp2        = sig.get("tp2")
     rr         = sig["rr"]
@@ -782,7 +833,6 @@ def format_signal_message(sig: dict) -> str:
     tp_label   = sig["tp_label"]
     order_id   = next_order_id(symbol, direction)
 
-    # Confluence 評級
     if conf_score >= 4:
         conf_grade = "A+（極強匯聚）"
     elif conf_score >= 3:
@@ -809,7 +859,6 @@ def format_signal_message(sig: dict) -> str:
         msg += f"  └ {' + '.join(conf_reasons[:3])}\n"
     msg += "\n"
 
-    # FIB OTE 資訊
     if fib_1h:
         ote_low  = min(fib_1h.get("0.618", 0), fib_1h.get("0.786", 0))
         ote_high = max(fib_1h.get("0.618", 0), fib_1h.get("0.786", 0))
@@ -819,7 +868,6 @@ def format_signal_message(sig: dict) -> str:
 
     msg += f"📈 交易方向: {dir_emoji}\n\n"
 
-    # 入場方式
     msg += f"💵 入場方式: {entry_label}\n"
     if disp_fvg:
         msg += f"   30% 市價入場: {fmt(sig['price'], symbol)}\n"
@@ -829,7 +877,7 @@ def format_signal_message(sig: dict) -> str:
     msg += "\n"
 
     msg += f"🛑 止損 (SL): {fmt(sl, symbol)}\n"
-    msg += f"   └ 15M Swing {'High' if direction == 'bearish' else 'Low'} 外\n\n"
+    msg += f"   └ {sl_desc}\n\n"
 
     msg += f"🎯 止盈 TP1: {fmt(tp1, symbol)}\n"
     msg += f"   └ {tp_label}\n"
@@ -838,7 +886,6 @@ def format_signal_message(sig: dict) -> str:
         msg += f"   └ 延伸目標（流動性）\n"
     msg += f"📊 預計 RR: 1:{rr:.1f}\n\n"
 
-    # 流動性參考
     if bsl or ssl:
         msg += "💧 流動性參考:\n"
         if bsl:
@@ -847,7 +894,6 @@ def format_signal_message(sig: dict) -> str:
             msg += f"   SSL（下方）: {fmt(ssl, symbol)}\n"
         msg += "\n"
 
-    # 重要水平
     if any(levels.get(k) for k in ['DO', 'WO', 'PDH', 'PDL', 'PWH', 'PWL']):
         msg += "📌 重要水平:\n"
         if levels.get('DO'):
@@ -863,21 +909,43 @@ def format_signal_message(sig: dict) -> str:
     msg += "⚠️ 確認風險後入場"
     return msg
 
+# ── 每小時快報（v4.3 重構）────────────────────────────
 def format_hourly_report(results: list) -> str:
     """
-    格式化每小時市場快報
-    所有關鍵位按價格由低至高排列，現價居中
-    顏色規則：
-      🔴 強阻力（PWH/PDH/WO/DO/1H FIB）
-      🟠 弱阻力（BSL/15M OB/FVG）
-      🟢 強支撐（PWL/PDL/WO/DO/1H FIB）
-      🔵 弱支撐（SSL/15M OB/FVG）
+    每小時市場快報 v4.3
+    ─────────────────────────────────────────────────────
+    只顯示 BTC（減少訊息長度，ETH/SOL 繼續發入場信號）
+
+    6 個關鍵位架構：
+      ① 最外圍上方 = 1H 最近 Swing High（方向轉折點）
+      ② 中間 2 個阻力 = 15M 最近供應位（由近至遠）
+      ③ 中間 2 個支撐 = 15M 最近需求位（由近至遠）
+      ④ 最外圍下方 = 1H 最近 Swing Low（方向轉折點）
+
+    重疊標記（後綴）：
+      若某個位置與 4H OB / 1H OB / 4H EQH/EQL / FIB 重疊
+      → 在後面加 [+4H OB] / [+1H OB] / [+4H EQH] / [+0.618] 等
+
+    層級陷阱警告：
+      若 15M 阻力上方有未測試的 1H 關鍵位 → ⚠️ 層級陷阱
+
+    顏色：
+      🔴 強阻力（1H Swing High / PWH/PDH/WO/DO/BSL）
+      🟠 弱阻力（15M OB/FVG/IFVG）
+      🟢 強支撐（1H Swing Low / PWL/PDL/WO/DO/SSL）
+      🔵 弱支撐（15M OB/FVG/IFVG）
     """
     now = datetime.now(HKT)
     msg  = f"🕐 每小時市場快報 [{now.strftime('%m-%d %H:%M')} HKT]\n"
     msg += "━━━━━━━━━━━━━━━━━━\n\n"
 
-    for result in results:
+    # v4.3: 只顯示 BTC
+    btc_result = next((r for r in results if r.get('symbol') == 'BTCUSDT'), None)
+    if not btc_result:
+        btc_result = results[0] if results else None
+    display_results = [btc_result] if btc_result else []
+
+    for result in display_results:
         try:
             if result.get("error"):
                 sym = result.get('symbol', '?').replace('USDT', '/USDT')
@@ -893,77 +961,123 @@ def format_hourly_report(results: list) -> str:
             bsl       = result.get("bsl")
             ssl       = result.get("ssl")
             fib_1h    = result.get("fib_1h")
+            zones_1h  = result.get("zones_1h", [])
+            zones_4h  = result.get("zones_4h", [])
             zones_15m = result.get("zones_15m", [])
+            highs_1h  = result.get("highs_1h", [])
+            lows_1h   = result.get("lows_1h", [])
+            eqh_list  = result.get("eqh", [])
+            eql_list  = result.get("eql", [])
 
-            msg += f"📌 {sym_short}  💲{fmt(price, symbol)}  |  1H {struct_emoji}\n"
+            # ── 層級陷阱檢查 ──────────────────────────────
+            is_trap, trap_msg = check_hierarchy_trap(price, struct_1h, zones_1h, zones_15m)
 
-            # ── 收集關鍵位 ──────────────────────────────
-            # 強位（高時間框架）→ 🔴 阻力 / 🟢 支撐
-            # 弱位（15M 流動性）→ 🟠 阻力 / 🔵 支撐
-            strong_levels = []
-            weak_levels   = []
+            # ── 標題行 ────────────────────────────────────
+            trap_warn = "  ⚠️ 層級陷阱" if is_trap else ""
+            msg += f"📌 {sym_short}  💲{fmt(price, symbol)}  |  1H {struct_emoji}{trap_warn}\n"
 
-            if levels.get('PWH'):
-                strong_levels.append((levels['PWH'], 'PWH 前週高'))
-            if levels.get('PWL'):
-                strong_levels.append((levels['PWL'], 'PWL 前週低'))
-            if levels.get('PDH'):
-                strong_levels.append((levels['PDH'], 'PDH 前日高'))
-            if levels.get('PDL'):
-                strong_levels.append((levels['PDL'], 'PDL 前日低'))
-            if levels.get('WO'):
-                strong_levels.append((levels['WO'], 'WO 週開盤'))
-            if levels.get('DO'):
-                strong_levels.append((levels['DO'], 'DO 日開盤'))
-            if fib_1h:
-                for k, lbl in [('0.618', 'FIB 0.618 OTE'), ('0.705', 'FIB 0.705 OTE'), ('0.786', 'FIB 0.786 OTE')]:
-                    v = fib_1h.get(k, 0)
-                    if v > 0:
-                        strong_levels.append((v, lbl))
+            # ── 1H Swing High/Low（最外圍定方向位）──────────
+            # 找最近的 1H Swing High（上方）和 Swing Low（下方）
+            sh_above = sorted([h[1] for h in highs_1h if h[1] > price])
+            sl_below = sorted([l[1] for l in lows_1h  if l[1] < price], reverse=True)
+            outer_above_price = sh_above[0]  if sh_above else None
+            outer_below_price = sl_below[0]  if sl_below else None
 
-            if bsl:
-                weak_levels.append((bsl, 'BSL 上方流動性'))
-            if ssl:
-                weak_levels.append((ssl, 'SSL 下方流動性'))
+            # ── 15M 候選關鍵位池（中間四個）────────────────
+            # 每個候選：(price, label, tf)
+            candidates_15m = []
 
-            # 15M 關鍵區：上方最近 3 個 + 下方最近 3 個
-            bear_zones = sorted(
-                [z for z in zones_15m if z.get('mid', 0) > price],
-                key=lambda z: z.get('mid', float('inf'))
-            )[:3]
-            bull_zones = sorted(
-                [z for z in zones_15m if z.get('mid', 0) < price],
-                key=lambda z: z.get('mid', 0),
-                reverse=True
-            )[:3]
-            for z in bear_zones:
-                lbl = f"{z.get('label', '關鍵區')} {fmt(z.get('low',0), symbol)}-{fmt(z.get('high',0), symbol)}"
-                weak_levels.append((z.get('mid', 0), lbl))
-            for z in bull_zones:
-                lbl = f"{z.get('label', '關鍵區')} {fmt(z.get('low',0), symbol)}-{fmt(z.get('high',0), symbol)}"
-                weak_levels.append((z.get('mid', 0), lbl))
+            def is_dup_15m(p):
+                return any(abs(p - c[0]) / max(c[0], 0.001) < 0.003 for c in candidates_15m)
 
-            # ── 合併排序 ────────────────────────────────
-            all_levels = [(p, lbl, 'strong') for p, lbl in strong_levels] + \
-                         [(p, lbl, 'weak')   for p, lbl in weak_levels]
-            all_levels.sort(key=lambda x: x[0])
+            # 週/日關鍵位加入 15M 候選（它們是最重要的近期位）
+            for key, lbl in [('PWH','PWH 前週高'),('PDH','PDH 前日高'),
+                              ('WO','WO 週開盤'),('DO','DO 日開盤'),
+                              ('BSL','BSL 上方流動性')]:
+                v = bsl if key == 'BSL' else levels.get(key)
+                if v and v > price and not is_dup_15m(v):
+                    candidates_15m.append((float(v), lbl, 'strong'))
 
-            insert_idx = next((i for i, (p, _, _) in enumerate(all_levels) if p > price), len(all_levels))
-            above = all_levels[insert_idx:]   # 高於現價（阻力）
-            below = all_levels[:insert_idx]   # 低於現價（支撐）
+            for key, lbl in [('PWL','PWL 前週低'),('PDL','PDL 前日低'),
+                              ('WO','WO 週開盤'),('DO','DO 日開盤'),
+                              ('SSL','SSL 下方流動性')]:
+                v = ssl if key == 'SSL' else levels.get(key)
+                if v and v < price and not is_dup_15m(v):
+                    candidates_15m.append((float(v), lbl, 'strong'))
 
-            # 上方阻力：由近至遠（由低至高）
-            for p, lbl, strength in above:
-                emoji = '🔴' if strength == 'strong' else '🟠'
-                msg += f"   {emoji} {fmt(p, symbol)}  {lbl}\n"
+            # 15M OB/FVG/IFVG
+            for z in zones_15m:
+                zm = z.get('mid', 0)
+                if zm and not is_dup_15m(zm):
+                    candidates_15m.append((zm, z.get('label', '15M 關鍵區'), 'weak'))
+
+            above_15m = sorted([(p,l,s) for p,l,s in candidates_15m if p > price], key=lambda x: x[0])
+            below_15m = sorted([(p,l,s) for p,l,s in candidates_15m if p < price], key=lambda x: x[0], reverse=True)
+
+            near_above = above_15m[:2]
+            near_below = below_15m[:2]
+
+            # ── 重疊標記函數 ──────────────────────────────
+            def overlap_tag(p: float) -> str:
+                tags = []
+                # FIB 重疊
+                if fib_1h:
+                    for k in ["0.5", "0.618", "0.705", "0.786"]:
+                        fv = fib_1h.get(k, 0)
+                        if fv and abs(p - fv) / max(fv, 0.001) < 0.005:
+                            tags.append(k)
+                # 4H OB 重疊
+                for z in zones_4h:
+                    zm = z.get('mid', 0)
+                    if zm and abs(p - zm) / max(zm, 0.001) < 0.005:
+                        tags.append("4H OB")
+                        break
+                # 1H OB/FVG 重疊
+                for z in zones_1h:
+                    zm = z.get('mid', 0)
+                    if zm and abs(p - zm) / max(zm, 0.001) < 0.005:
+                        tags.append("1H OB")
+                        break
+                # 4H EQH/EQL 重疊
+                for e in eqh_list:
+                    ep = e.get('price', 0) if isinstance(e, dict) else e
+                    if ep and abs(p - ep) / max(ep, 0.001) < 0.005:
+                        tags.append("4H EQH")
+                        break
+                for e in eql_list:
+                    ep = e.get('price', 0) if isinstance(e, dict) else e
+                    if ep and abs(p - ep) / max(ep, 0.001) < 0.005:
+                        tags.append("4H EQL")
+                        break
+                return f" [+{', '.join(tags)}]" if tags else ""
+
+            # ── 輸出 ──────────────────────────────────────
+            # 最外圍上方（1H Swing High）
+            if outer_above_price:
+                ot = overlap_tag(outer_above_price)
+                msg += f"   🔴 {fmt(outer_above_price, symbol)}  1H 結構高點（BOS 目標）{ot}\n"
+
+            # 中間 2 個阻力（由遠至近，近的靠近現價）
+            for p, lbl, st in reversed(near_above):
+                emoji = '🔴' if st == 'strong' else '🟠'
+                msg += f"   {emoji} {fmt(p, symbol)}  {lbl}{overlap_tag(p)}\n"
 
             # 現價分隔線
             msg += f"   ──── 💲{fmt(price, symbol)} 現價 ────\n"
 
-            # 下方支撐：由近至遠（由高至低）
-            for p, lbl, strength in reversed(below):
-                emoji = '🟢' if strength == 'strong' else '🔵'
-                msg += f"   {emoji} {fmt(p, symbol)}  {lbl}\n"
+            # 中間 2 個支撐（由近至遠）
+            for p, lbl, st in near_below:
+                emoji = '🟢' if st == 'strong' else '🔵'
+                msg += f"   {emoji} {fmt(p, symbol)}  {lbl}{overlap_tag(p)}\n"
+
+            # 最外圍下方（1H Swing Low）
+            if outer_below_price:
+                ot = overlap_tag(outer_below_price)
+                msg += f"   🟢 {fmt(outer_below_price, symbol)}  1H 結構低點（跌破轉勢）{ot}\n"
+
+            # 層級陷阱警告詳情
+            if is_trap:
+                msg += f"   ⚠️ {trap_msg}\n"
 
             msg += "\n"
 
@@ -989,22 +1103,21 @@ async def main():
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     last_hourly = 0
-    last_signals: dict = {}  # 防止重複發送（同一幣種+方向 10 分鐘內不重複）
+    last_signals: dict = {}
 
-    # 啟動訊息
     await send_msg(bot,
-        "✅ ICT/SMC 交易信號機械人 v4.1 已啟動\n\n"
-        "📊 監控: BTC / ETH / SOL\n"
+        "✅ ICT/SMC 交易信號機械人 v4.3 已啟動\n\n"
+        "📊 快報: BTC（每小時）  |  信號: BTC / ETH / SOL\n"
         "🎯 框架: 1H 定方向 → 15M 關鍵位 → 3M MSS → FIB OTE 入場\n"
-        "🔧 v4.1 修復: 數據源改用 data-api.binance.vision（無地區限制）\n"
-        "🔧 v4.1 修復: 每小時快報縮排 bug 已修正\n"
-        "📐 SL: 15M Swing High/Low 外（最少 1×ATR）\n"
-        "💰 順勢全倉（50 USDT）/ 逆勢半倉（25 USDT）\n"
-        "📊 RR ≥ 1:2 才發信號\n"
-        "🌐 數據: data-api.binance.vision（1H 500根 / 15M 300根 / 3M 200根）"
+        "🔧 v4.3①: SL = 15M OB/FVG Low/High 外側 + ATR×0.5 緩衝\n"
+        "🔧 v4.3②: 快報最外圍位 = 1H 結構高/低點（BOS/轉勢點）\n"
+        "🔧 v4.3③: 重疊標記（+4H OB / +1H OB / +4H EQH / +0.618）\n"
+        "🔧 v4.3④: 層級陷阱警告（⚠️ 15M 阻力上方有 1H 未測試位）\n"
+        "🔧 v4.3⑤: 動態 RR（最少 1:2，根據關鍵位動態計算）\n"
+        "🌐 數據: data-api.binance.vision（1H 500根 / 4H 200根 / 15M 300根 / 3M 200根）"
     )
 
-    logger.info("機械人 v4.1 已啟動，開始掃描...")
+    logger.info("機械人 v4.3 已啟動，開始掃描...")
 
     while True:
         try:
@@ -1024,7 +1137,7 @@ async def main():
                     if signal:
                         sig_key = f"{symbol}_{signal['direction']}"
                         last_time = last_signals.get(sig_key, 0)
-                        if now_ts - last_time > 600:  # 10 分鐘防重複
+                        if now_ts - last_time > 600:
                             msg = format_signal_message(signal)
                             await send_msg(bot, msg)
                             last_signals[sig_key] = now_ts
@@ -1033,7 +1146,6 @@ async def main():
                 except Exception as e:
                     logger.error(f"{symbol} 掃描錯誤: {e}")
 
-            # 每小時快報
             if now_ts - last_hourly >= HOURLY_REPORT_INTERVAL:
                 if results:
                     try:
@@ -1044,7 +1156,7 @@ async def main():
                     except Exception as e:
                         logger.error(f"每小時快報發送失敗: {e}")
                         await send_msg(bot, f"⚠️ 每小時快報生成失敗: {e}")
-                        last_hourly = now_ts  # 避免無限重試
+                        last_hourly = now_ts
 
         except Exception as e:
             logger.error(f"主循環錯誤: {e}")
