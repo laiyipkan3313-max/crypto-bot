@@ -845,7 +845,7 @@ def format_directional_analysis(result: dict, session_name: str) -> str:
     atr_15m   = result.get("atr_15m", price * 0.005)
     now       = datetime.now(HKT)
 
-    # ── 整體偏向判斷 ──────────────────────────────────────────────
+    # ── 整體偏向判斷：4H 大方向 + 1H 短期結構 ────────────────────
     if struct_4h == "bullish" and struct_1h == "bullish":
         bias = "偏看漲"
         bias_emoji = "🟢"
@@ -866,11 +866,36 @@ def format_directional_analysis(result: dict, session_name: str) -> str:
         bias_emoji = "🟡"
         bias_reason = "4H 看跌但 1H 出現反彈結構，等待 1H 確認轉跌"
         primary_dir = "bearish"
+    elif struct_4h == "ranging" and struct_1h == "bullish":
+        # 4H 橫盤但 1H 已看漲：以 1H 為主偏向
+        bias = "1H 看漲，4H 尚未確認"
+        bias_emoji = "🟡"
+        bias_reason = "1H 結構已看漲（HH/HL），4H 尚在整理中，顧待 4H 結構確認"
+        primary_dir = "bullish"
+    elif struct_4h == "ranging" and struct_1h == "bearish":
+        # 4H 橫盤但 1H 已看跌：以 1H 為主偏向
+        bias = "1H 看跌，4H 尚未確認"
+        bias_emoji = "🟡"
+        bias_reason = "1H 結構已看跌（LH/LL），4H 尚在整理中，小心向下空間"
+        primary_dir = "bearish"
+    elif struct_4h == "bullish" and struct_1h == "ranging":
+        # 4H 看漲但 1H 橫盤：大方向偏看漲，等待 1H 結構形成
+        bias = "4H 看漲，1H 整理中"
+        bias_emoji = "🟡"
+        bias_reason = "4H 結構看漲，1H 尚在整理，偏向偏多，等待 1H 形成看漲結構再入"
+        primary_dir = "bullish"
+    elif struct_4h == "bearish" and struct_1h == "ranging":
+        # 4H 看跌但 1H 橫盤：大方向偏看跌，等待 1H 結構形成
+        bias = "4H 看跌，1H 整理中"
+        bias_emoji = "🟡"
+        bias_reason = "4H 結構看跌，1H 尚在整理，偏向偏空，等待 1H 形成看跌結構再入"
+        primary_dir = "bearish"
     else:
+        # 4H + 1H 均橫盤
         bias = "橫盤整理"
         bias_emoji = "⚪"
-        bias_reason = "4H/1H 結構不明確，等待方向選擇"
-        primary_dir = "bullish"
+        bias_reason = "4H + 1H 結構均不明確，建議等待方向選擇再入"
+        primary_dir = "bullish"  # 橫盤時默認展示雙向
 
     # ── 計算看漲情景 TP / 入場 / SL ──────────────────────────────
     # 入場：最近的看漲 OB/FVG 中點
@@ -966,32 +991,48 @@ def format_directional_analysis(result: dict, session_name: str) -> str:
 
     msg += "\n"
 
-    # ── 看漲情景（TP 在上，SL 在下）──────────────────────────────
-    msg += "🟢 看漲情景（主路線）：\n" if primary_dir == "bullish" else "🟢 看漲情景（備用路線）：\n"
-    msg += f"   🎯 TP：{fmt(bull_tp, symbol)}（{bull_tp_label}）\n"
-    msg += f"   📍 入場：{fmt(bull_entry, symbol)}（{bull_entry_label}）\n"
-    msg += f"   🛑 SL：{fmt(bull_sl, symbol)}（{bull_sl_desc}）\n"
-    msg += f"   入場條件：{bull_entry_cond}\n"
-    if bull_rr >= 1.5:
-        msg += f"   RR：1:{bull_rr:.1f}\n"
+    # ── 判斷是「同向」還是「不同向 / 橫盤」──────────────────
+    aligned = (struct_4h == struct_1h) and struct_4h != "ranging"
 
-    msg += "\n"
-
-    # ── 看跌情景（SL 在上，TP 在下）──────────────────────────────
-    msg += "🔴 看跌情景（主路線）：\n" if primary_dir == "bearish" else "🔴 看跌情景（備用路線）：\n"
-    msg += f"   🛑 SL：{fmt(bear_sl, symbol)}（{bear_sl_desc}）\n"
-    msg += f"   📍 入場：{fmt(bear_entry, symbol)}（{bear_entry_label}）\n"
-    msg += f"   🎯 TP：{fmt(bear_tp, symbol)}（{bear_tp_label}）\n"
-    msg += f"   入場條件：{bear_entry_cond}\n"
-    if bear_rr >= 1.5:
-        msg += f"   RR：1:{bear_rr:.1f}\n"
-
-    msg += "\n"
-
-    # 逆勢備注
-    if primary_dir != "ranging":
-        counter_dir = "做空" if primary_dir == "bullish" else "做多"
-        msg += f"⚠️ 逆勢{counter_dir}屬備用路線，建議減半倉位（風險 $25）\n"
+    if aligned:
+        # ── 4H + 1H 同向：只展示主方向，另一方向縮為一行備注 ──
+        if primary_dir == "bullish":
+            msg += "🟢 看漲情景（主路線）：\n"
+            msg += f"   🎯 TP：{fmt(bull_tp, symbol)}（{bull_tp_label}）\n"
+            msg += f"   📍 入場：{fmt(bull_entry, symbol)}（{bull_entry_label}）\n"
+            msg += f"   🛑 SL：{fmt(bull_sl, symbol)}（{bull_sl_desc}）\n"
+            msg += f"   入場條件：{bull_entry_cond}\n"
+            msg += f"   RR：1:{bull_rr:.1f}\n"
+            msg += "\n"
+            msg += f"🔴 看跌備用：若價格升至 {fmt(bear_entry, symbol)} 遇阻且 3M 結構轉跌，再考慮逆勢做空（風險 $25）\n"
+        else:
+            msg += "🔴 看跌情景（主路線）：\n"
+            msg += f"   🛑 SL：{fmt(bear_sl, symbol)}（{bear_sl_desc}）\n"
+            msg += f"   📍 入場：{fmt(bear_entry, symbol)}（{bear_entry_label}）\n"
+            msg += f"   🎯 TP：{fmt(bear_tp, symbol)}（{bear_tp_label}）\n"
+            msg += f"   入場條件：{bear_entry_cond}\n"
+            msg += f"   RR：1:{bear_rr:.1f}\n"
+            msg += "\n"
+            msg += f"🟢 看漲備用：若價格回踩 {fmt(bull_entry, symbol)} 且 3M 結構轉漲，再考慮逆勢做多（風險 $25）\n"
+    else:
+        # ── 4H + 1H 不同向 / 橫盤：平衡展示雙向，讓用戶自己判斷 ──
+        msg += "🟢 看漲情景：\n"
+        msg += f"   🎯 TP：{fmt(bull_tp, symbol)}（{bull_tp_label}）\n"
+        msg += f"   📍 入場：{fmt(bull_entry, symbol)}（{bull_entry_label}）\n"
+        msg += f"   🛑 SL：{fmt(bull_sl, symbol)}（{bull_sl_desc}）\n"
+        msg += f"   入場條件：{bull_entry_cond}\n"
+        if bull_rr >= 1.5:
+            msg += f"   RR：1:{bull_rr:.1f}\n"
+        msg += "\n"
+        msg += "🔴 看跌情景：\n"
+        msg += f"   🛑 SL：{fmt(bear_sl, symbol)}（{bear_sl_desc}）\n"
+        msg += f"   📍 入場：{fmt(bear_entry, symbol)}（{bear_entry_label}）\n"
+        msg += f"   🎯 TP：{fmt(bear_tp, symbol)}（{bear_tp_label}）\n"
+        msg += f"   入場條件：{bear_entry_cond}\n"
+        if bear_rr >= 1.5:
+            msg += f"   RR：1:{bear_rr:.1f}\n"
+        msg += "\n"
+        msg += "⚠️ 方向尚未同步，建議兩個方向均以半倉位入場，等待 4H + 1H 結構同步後再加倉\n"
 
     return msg.rstrip()
 
