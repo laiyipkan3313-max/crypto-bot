@@ -705,11 +705,24 @@ def format_limit_order(data: dict) -> str:
         entry = best.price
         zone_label = " + ".join(best.labels[:3]) if best.labels else "OB"
 
-        # SL：框架外側 + ATR × 0.3
+        # SL：用 Swing Low/High 外側 + ATR×0.3（掛單專用，給更大呼吸空間）
+        # 邏輯：取 1H 和 15M Swing 中更遠的那個，再加 ATR×0.3 緩衝
+        swings_1h = data.get("swings_1h", {})
+        swings_15m = data.get("swings_15m", {})
         if is_bull:
-            sl = best.low - atr * 0.3
+            # 做多：SL 放在最近 Swing Low 外側（取更低的，更保守）
+            swing_low_1h = swings_1h.get("swing_low", best.low)
+            swing_low_15m = swings_15m.get("swing_low", best.low)
+            swing_sl_base = min(swing_low_1h, swing_low_15m)
+            # 確保比 OB 底部更低
+            sl = min(swing_sl_base, best.low) - atr * 0.3
         else:
-            sl = best.high + atr * 0.3
+            # 做空：SL 放在最近 Swing High 外側（取更高的，更保守）
+            swing_high_1h = swings_1h.get("swing_high", best.high)
+            swing_high_15m = swings_15m.get("swing_high", best.high)
+            swing_sl_base = max(swing_high_1h, swing_high_15m)
+            # 確保比 OB 頂部更高
+            sl = max(swing_sl_base, best.high) + atr * 0.3
 
         # 低流動性加寬 SL
         liq_note = ""
@@ -742,13 +755,13 @@ def format_limit_order(data: dict) -> str:
                 f"   🎯 TP2：{tp_data['tp2']:,.2f}（{tp_data['tp2_label']}）RR 1:{tp_data['tp2_rr']:.1f}\n"
                 f"   🎯 TP1：{tp_data['tp1']:,.2f}（{tp_data['tp1_label']}）RR 1:{tp_data['tp1_rr']:.1f}\n"
                 f"   📍 入場：{entry:,.2f}（{zone_label}）\n"
-                f"   🛑 SL：{sl:,.2f}（底部外 + ATR×0.3{liq_note}）"
+                f"   🛑 SL：{sl:,.2f}（Swing Low 外側 + ATR×0.3{liq_note}）"
             )
         else:
             cancel_price = entry + sl_dist * 0.5
             cancel_note = f"若未反彈直接突破 {cancel_price:,.2f}，取消掛單"
             trade_block = (
-                f"   🛑 SL：{sl:,.2f}（頂部外 + ATR×0.3{liq_note}）\n"
+                f"   🛑 SL：{sl:,.2f}（Swing High 外側 + ATR×0.3{liq_note}）\n"
                 f"   📍 入場：{entry:,.2f}（{zone_label}）\n"
                 f"   🎯 TP1：{tp_data['tp1']:,.2f}（{tp_data['tp1_label']}）RR 1:{tp_data['tp1_rr']:.1f}\n"
                 f"   🎯 TP2：{tp_data['tp2']:,.2f}（{tp_data['tp2_label']}）RR 1:{tp_data['tp2_rr']:.1f}"
