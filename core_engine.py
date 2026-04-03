@@ -18,62 +18,61 @@ HKT = timezone(timedelta(hours=8))
 # 資料拉取
 # ─────────────────────────────────────────
 
-# Bybit interval mapping (Binance format -> Bybit format)
-_BYBIT_INTERVAL_MAP = {
-    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
-    "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
-    "1d": "D", "1w": "W",
-}
+# Binance 公開數據端點（無地區限制，US 可用）
+_BINANCE_ENDPOINTS = [
+    "https://data-api.binance.vision",  # 官方公開數據 API，無地區封鎖
+    "https://api.binance.us",           # Binance US 備用
+    "https://api1.binance.com",         # 備用 1
+    "https://api2.binance.com",         # 備用 2
+]
 
 
 def fetch_klines(symbol: str, interval: str, limit: int = 300) -> list[dict]:
-    """從 Bybit 拉取 K 線數據（相容 US 地區，不受 Binance 封鎖）"""
-    bybit_interval = _BYBIT_INTERVAL_MAP.get(interval, interval)
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": bybit_interval,
-        "limit": limit,
-    }
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        if data.get("retCode") != 0:
-            return []
-        items = data["result"]["list"]
-        if not items:
-            return []
-        # Bybit 返回最新在前（降序），需反轉為升序
-        return [
-            {
-                "ts": int(d[0]),
-                "open": float(d[1]),
-                "high": float(d[2]),
-                "low": float(d[3]),
-                "close": float(d[4]),
-                "volume": float(d[5]),
-            }
-            for d in reversed(items)
-        ]
-    except Exception:
-        return []
+    """從 Binance 公開數據 API 拉取 K 線（自動嘗試多個端點，相容 US 地區）"""
+    for base in _BINANCE_ENDPOINTS:
+        try:
+            r = requests.get(
+                f"{base}/api/v3/klines",
+                params={"symbol": symbol, "interval": interval, "limit": limit},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                continue
+            return [
+                {
+                    "ts": int(d[0]),
+                    "open": float(d[1]),
+                    "high": float(d[2]),
+                    "low": float(d[3]),
+                    "close": float(d[4]),
+                    "volume": float(d[5]),
+                }
+                for d in data
+            ]
+        except Exception:
+            continue
+    return []
 
 
 def get_current_price(symbol: str) -> float:
-    """取得現價（Bybit）"""
-    try:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/tickers",
-            params={"category": "linear", "symbol": symbol},
-            timeout=5,
-        )
-        data = r.json()
-        if data.get("retCode") == 0:
-            return float(data["result"]["list"][0]["lastPrice"])
-        return 0.0
-    except Exception:
-        return 0.0
+    """取得現價（Binance 公開數據 API）"""
+    for base in _BINANCE_ENDPOINTS:
+        try:
+            r = requests.get(
+                f"{base}/api/v3/ticker/price",
+                params={"symbol": symbol},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if "price" in data:
+                    return float(data["price"])
+        except Exception:
+            continue
+    return 0.0
 
 
 # ─────────────────────────────────────────
