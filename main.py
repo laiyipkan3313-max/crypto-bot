@@ -1201,9 +1201,246 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg)
 
-# ── 訊息處理：幣種查詢 ─────────────────────────────────────────────
-SYMBOL_MAP = {
-    "BTC": "BTCUSDT",
+# ── 掛單建議功能 ─────────────────────────────────────────────────────
+def format_limit_order(result: dict) -> str:
+    """
+    掛單建議格式
+    - 主力用 1H 結構決定方向
+    - 若 4H + 1H 同向，標注「高勝率」
+    - 入場：局部回調空間內的 1H/15M OB
+    - TP1：15M 關鍵位（保守）
+    - TP2：1H 關鍵位（延伸）
+    - 有效期：根據詢問時間自動計算
+    """
+    symbol    = result["symbol"]
+    sym_short = symbol.replace("USDT", "/USDT")
+    price     = result["price"]
+    struct_1h = result.get("struct_1h", "ranging")
+    struct_4h = result.get("struct_4h", "ranging")
+    zones_1h  = result.get("zones_1h", [])
+    zones_15m = result.get("zones_15m", [])
+    highs_15m = result.get("highs_15m", [])
+    lows_15m  = result.get("lows_15m", [])
+    atr_15m   = result.get("atr_15m", price * 0.005)
+    bsl       = result.get("bsl")
+    ssl       = result.get("ssl")
+    eqh       = result.get("eqh", [])
+    eql       = result.get("eql", [])
+    now       = datetime.now(HKT)
+
+    # ── 判斷方向與勝率 ────────────────────────────────────
+    if struct_1h == "ranging":
+        return f"⚠️ {sym_short} 當前 1H 結構橫盤，暫不適合掛單，建議等待方向明確後再掛單。"
+
+    direction = struct_1h
+    aligned   = (struct_4h == struct_1h) and struct_4h != "ranging"
+
+    if direction == "bullish":
+        dir_emoji = "🟢"
+        dir_text  = "做多"
+    else:
+        dir_emoji = "🔴"
+        dir_text  = "做空"
+
+    if aligned:
+        confidence = "高勝率（4H + 1H 同向）"
+        conf_emoji = "✅"
+    else:
+        confidence = f"注意 4H {struct_4h}，尚未與 1H 同步"
+        conf_emoji = "🟡"
+
+    # ── 入場位：局部回調空間內的 1H/15M OB ───────────────
+    if direction == "bullish":
+        # 尋找當前價格下方最近的看漲 OB（局部回調支撑）
+        entry_zones = sorted(
+            [z for z in zones_15m + zones_1h
+             if z.get('direction') == 'bullish'
+             and z.get('mid', 0) < price
+             and z.get('mid', 0) > price * 0.97],  # 限制在 3% 回調範圍內
+            key=lambda z: abs(z.get('mid', 0) - price))
+
+        if not entry_zones:
+            return f"⚠️ {sym_short} 當前價格附近（向下 3%）無合適的看漲 OB 可掛單，建議市價入場或等待回調。"
+
+        entry_zone  = entry_zones[0]
+        entry_price = entry_zone['mid']
+        entry_label = entry_zone.get('label', '15M 看漲 OB')
+
+        sl, sl_desc = find_sl_anchor_zone(
+            entry_price, "bullish", zones_15m, [], highs_15m, lows_15m, atr_15m)
+        if direction == "bullish" and sl >= entry_price:
+            sl = entry_price - atr_15m * 2
+            sl_desc = "ATR×2 保護"
+
+        # 睡覺時段加寬 SL
+        if 0 <= now.hour < 8:
+            sl = sl - price * 0.002
+            sl_desc += "（含夜間加寬）"
+
+        sl_dist = abs(entry_price - sl)
+
+        # TP1：15M 關鍵位（保守）
+        tp1 = None
+        tp1_label = ""
+        above_15m = sorted(
+            [z for z in zones_15m if z.get('direction') == 'bearish' and z.get('mid', 0) > entry_price],
+            key=lambda z: z.get('mid', 0))
+        if above_15m:
+            tp1 = above_15m[0]['mid']
+            tp1_label = above_15m[0].get('label', '15M 供應區')
+        else:
+            above_eqh = sorted([e["price"] for e in eqh if e["price"] > entry_price])
+            if above_eqh:
+                tp1 = above_eqh[0]
+                tp1_label = "15M EQH"
+        if not tp1:
+            tp1 = entry_price + sl_dist * 2.0
+            tp1_label = "1:2 RR 目標"
+
+        # TP2：1H 關鍵位（延伸）
+        tp2 = None
+        tp2_label = ""
+        if bsl and bsl > entry_price:
+            tp2 = bsl
+            tp2_label = "BSL 上方流動性"
+        else:
+            above_1h = sorted(
+                [z for z in zones_1h if z.get('direction') == 'bearish' and z.get('mid', 0) > entry_price],
+                key=lambda z: z.get('mid', 0))
+            if above_1h:
+                tp2 = above_1h[0]['mid']
+                tp2_label = above_1h[0].get('label', '1H 供應區')
+        if not tp2:
+            tp2 = entry_price + sl_dist * 4.0
+            tp2_label = "1:4 RR 目標"
+
+        cancel_price = price + sl_dist * 1.5
+        cancel_note  = f"若價格未回調直接突破 {fmt(cancel_price, symbol)}，請取消掛單"
+
+    else:  # bearish
+        entry_zones = sorted(
+            [z for z in zones_15m + zones_1h
+             if z.get('direction') == 'bearish'
+             and z.get('mid', 0) > price
+             and z.get('mid', 0) < price * 1.03],
+            key=lambda z: abs(z.get('mid', 0) - price))
+
+        if not entry_zones:
+            return f"⚠️ {sym_short} 當前價格附近（向上 3%）無合適的看跌 OB 可掛單，建議市價入場或等待反彈。"
+
+        entry_zone  = entry_zones[0]
+        entry_price = entry_zone['mid']
+        entry_label = entry_zone.get('label', '15M 看跌 OB')
+
+        sl, sl_desc = find_sl_anchor_zone(
+            entry_price, "bearish", zones_15m, [], highs_15m, lows_15m, atr_15m)
+        if direction == "bearish" and sl <= entry_price:
+            sl = entry_price + atr_15m * 2
+            sl_desc = "ATR×2 保護"
+
+        if 0 <= now.hour < 8:
+            sl = sl + price * 0.002
+            sl_desc += "（含夜間加寬）"
+
+        sl_dist = abs(entry_price - sl)
+
+        # TP1：15M 關鍵位
+        tp1 = None
+        tp1_label = ""
+        below_15m = sorted(
+            [z for z in zones_15m if z.get('direction') == 'bullish' and z.get('mid', 0) < entry_price],
+            key=lambda z: z.get('mid', 0), reverse=True)
+        if below_15m:
+            tp1 = below_15m[0]['mid']
+            tp1_label = below_15m[0].get('label', '15M 需求區')
+        else:
+            below_eql = sorted([e["price"] for e in eql if e["price"] < entry_price], reverse=True)
+            if below_eql:
+                tp1 = below_eql[0]
+                tp1_label = "15M EQL"
+        if not tp1:
+            tp1 = entry_price - sl_dist * 2.0
+            tp1_label = "1:2 RR 目標"
+
+        # TP2：1H 關鍵位
+        tp2 = None
+        tp2_label = ""
+        if ssl and ssl < entry_price:
+            tp2 = ssl
+            tp2_label = "SSL 下方流動性"
+        else:
+            below_1h = sorted(
+                [z for z in zones_1h if z.get('direction') == 'bullish' and z.get('mid', 0) < entry_price],
+                key=lambda z: z.get('mid', 0), reverse=True)
+            if below_1h:
+                tp2 = below_1h[0]['mid']
+                tp2_label = below_1h[0].get('label', '1H 需求區')
+        if not tp2:
+            tp2 = entry_price - sl_dist * 4.0
+            tp2_label = "1:4 RR 目標"
+
+        cancel_price = price - sl_dist * 1.5
+        cancel_note  = f"若價格未反彈直接跌破 {fmt(cancel_price, symbol)}，請取消掛單"
+
+    # ── 校驗 TP 方向 ───────────────────────────────────────────
+    if direction == "bullish":
+        if tp1 <= entry_price:
+            tp1 = entry_price + sl_dist * 2.0
+            tp1_label = "1:2 RR 目標（已修正）"
+        if tp2 <= entry_price:
+            tp2 = entry_price + sl_dist * 4.0
+            tp2_label = "1:4 RR 目標（已修正）"
+    else:
+        if tp1 >= entry_price:
+            tp1 = entry_price - sl_dist * 2.0
+            tp1_label = "1:2 RR 目標（已修正）"
+        if tp2 >= entry_price:
+            tp2 = entry_price - sl_dist * 4.0
+            tp2_label = "1:4 RR 目標（已修正）"
+
+    # ── 計算 RR ──────────────────────────────────────────────
+    rr1 = abs(tp1 - entry_price) / sl_dist if sl_dist > 0 else 0
+    rr2 = abs(tp2 - entry_price) / sl_dist if sl_dist > 0 else 0
+
+    # ── 有效期自動計算 ────────────────────────────────────────
+    hour = now.hour
+    if 0 <= hour < 8:
+        expire_time = "次日 08:00 HKT（亞洲盤開市前取消）"
+    elif 8 <= hour < 12:
+        expire_time = "17:00 HKT（歐洲盤開市前取消）"
+    elif 12 <= hour < 20:
+        expire_time = "23:30 HKT（紐約盤開市前取消）"
+    else:
+        expire_time = "次日 08:00 HKT（亞洲盤開市前取消）"
+
+    # ── 組裝訊息 ──────────────────────────────────────────────
+    msg  = f"📌 {sym_short} 掛單建議 [{now.strftime('%m-%d %H:%M')} HKT]\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += f"{conf_emoji} {dir_emoji} 方向：{dir_text}（{confidence}）\n"
+    msg += f"📍 掛單入場：{fmt(entry_price, symbol)}（{entry_label}）\n\n"
+
+    if direction == "bullish":
+        # 做多：由上至下 = TP2 → TP1 → 入場 → SL
+        msg += f"🎯 TP2：{fmt(tp2, symbol)}（{tp2_label}）\n"
+        msg += f"🎯 TP1：{fmt(tp1, symbol)}（{tp1_label}）\n"
+        msg += f"📍 入場：{fmt(entry_price, symbol)}\n"
+        msg += f"🛑 SL：{fmt(sl, symbol)}（{sl_desc}）\n\n"
+    else:
+        # 做空：由上至下 = SL → 入場 → TP1 → TP2
+        msg += f"🛑 SL：{fmt(sl, symbol)}（{sl_desc}）\n"
+        msg += f"📍 入場：{fmt(entry_price, symbol)}\n"
+        msg += f"🎯 TP1：{fmt(tp1, symbol)}（{tp1_label}）\n"
+        msg += f"🎯 TP2：{fmt(tp2, symbol)}（{tp2_label}）\n\n"
+
+    msg += f"📊 RR（至 TP1）：1:{rr1:.1f}\n"
+    msg += f"📊 RR（至 TP2）：1:{rr2:.1f}\n"
+    msg += f"⏰ 有效期：至 {expire_time}\n"
+    msg += f"⚠️ {cancel_note}\n"
+
+    return msg.rstrip()
+
+# ── 訊息處理：幣種查詢 ─────────────────────────────────────────────────────
+SYMBOL_MAP = {"BTC": "BTCUSDT",
     "ETH": "ETHUSDT",
     "SOL": "SOLUSDT",
     "BNB": "BNBUSDT",
@@ -1222,6 +1459,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().upper()
     chat_id = str(update.message.chat_id)
 
+    # 掛單建議（例如「BTC掛單」「BTC LIMIT」）
+    for sym_key, sym_full in SYMBOL_MAP.items():
+        if text in (f"{sym_key}掛單", f"{sym_key} 掛單", f"{sym_key}LIMIT", f"{sym_key} LIMIT"):
+            await update.message.reply_text(f"⏳ 正在計算 {sym_key}/USDT 掛單建議，請稍候...")
+            result = analyze_symbol(sym_full)
+            if result.get("error"):
+                await update.message.reply_text(f"⚠️ 分析失敗：{result['error']}")
+                return
+            msg = format_limit_order(result)
+            await send_msg(context.bot, msg, chat_id=chat_id)
+            return
     # 雙向情景分析（例如「BTC分析」「BTC 分析」）
     for sym_key, sym_full in SYMBOL_MAP.items():
         if text in (f"{sym_key}分析", f"{sym_key} 分析", f"{sym_key}ANALYSIS"):
@@ -1253,7 +1501,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❓ 未識別幣種「{text}」\n"
             "支援：BTC / ETH / SOL / BNB / XRP / DOGE / ADA / AVAX / DOT / LINK\n"
             "查詢格式：直接輸入幣種名稱，例如 BTC\n"
-            "雙向分析：輸入「BTC分析」"
+            "雙向分析：輸入「BTC分析」\n"
+            "掛單建議：輸入「BTC掛單」"
         )
 
 # ── 主掃描循環（入場訊號）─────────────────────────────────────────
